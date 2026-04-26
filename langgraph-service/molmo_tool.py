@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -118,6 +119,7 @@ def enrich_molmo_result_for_client(
     """Attach image size and normalize point coords to 0–1 for SSE/UI when we know pixel dimensions.
 
     Shallow-copies the dict and point objects so downstream mutations do not affect LangGraph state.
+    Per-point ``depth_m`` (if attached upstream by the Molmo tool) is preserved.
     """
     if dims is None:
         return d
@@ -215,13 +217,48 @@ def molmo_result_dict_for_json(out: dict) -> dict:
     return d
 
 
+def attach_depth_to_tool_payload(
+    out: dict,
+    depth_lookup: Callable[[float, float], float | None] | None,
+) -> dict:
+    """Mutate `out["points"]` to attach `depth_m` per point. Used inside the Molmo tool when an
+    OAK capture's depth map is available, so the agent's tool message also carries distance.
+    """
+    if depth_lookup is None:
+        return out
+    pts = out.get("points")
+    if not isinstance(pts, list):
+        return out
+    wi = out.get("image_width")
+    hi = out.get("image_height")
+    have_dims = isinstance(wi, int) and isinstance(hi, int) and wi > 0 and hi > 0
+    for p in pts:
+        if not isinstance(p, dict):
+            continue
+        try:
+            xv = float(p.get("x", 0.0))
+            yv = float(p.get("y", 0.0))
+        except (TypeError, ValueError):
+            p["depth_m"] = None
+            continue
+        # Points may still be in pixel space at this stage (call_molmo_point normalizes only when dims are known)
+        xn = xv / wi if have_dims and xv > 1.0 else xv
+        yn = yv / hi if have_dims and yv > 1.0 else yv
+        try:
+            dm = depth_lookup(xn, yn)
+        except Exception:
+            dm = None
+        p["depth_m"] = round(dm, 2) if isinstance(dm, (int, float)) else None
+    return out
+
+
 @tool
 def molmo_point_localize(image_path: str, prompt: str) -> str:
     """Run MolmoPoint on a host-local image file to locate objects from a text description.
 
-    Use this when the user needs 2D coordinates of objects in an image. The file must
+    Use this when the user needs positions of objects in an image. The file must
     exist on the same machine as MolmoPoint; pass an absolute or resolvable path (e.g. a
-    camera frame under /data). Returns JSON with a ``points`` list: object_id, image_index, x, y.
+    camera frame under /data). Returns JSON with a ``points`` list: object_id, image_index, x, y, distance.
     If MolmoPoint is not running or the path is not allowed, the string explains the error.
     """
     out = call_molmo_point(image_path, prompt)

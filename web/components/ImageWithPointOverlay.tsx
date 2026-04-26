@@ -8,6 +8,8 @@ export type MolmoPoint = {
   image_index: number;
   x: number;
   y: number;
+  /** Distance to the point in meters, when sourced from an OAK-D capture; null for depth holes. */
+  depth_m?: number | null;
 };
 
 type Props = {
@@ -54,7 +56,13 @@ export function ImageWithPointOverlay({ imageUrl, points, alt = "Upload" }: Prop
         const { nx, ny } = normalizeMolmoXY(pt.x, pt.y, imgSize.w, imgSize.h);
         const displayNum = i + 1;
         const bg = chipColorForObjectId(pt.object_id);
-        const label = `Detection ${displayNum}: object_id=${pt.object_id}, image_index=${pt.image_index}, x=${nx.toFixed(4)}, y=${ny.toFixed(4)} (normalized 0-1 in image space)`;
+        const depthSuffix =
+          typeof pt.depth_m === "number"
+            ? `, depth=${pt.depth_m.toFixed(2)} m`
+            : pt.depth_m === null
+              ? `, depth=— (out of range)`
+              : "";
+        const label = `Detection ${displayNum}: object_id=${pt.object_id}, image_index=${pt.image_index}, x=${nx.toFixed(4)}, y=${ny.toFixed(4)}${depthSuffix} (normalized 0-1 in image space)`;
         return (
           <div
             key={`${pt.object_id}-${pt.image_index}-${i}`}

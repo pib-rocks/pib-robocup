@@ -74,6 +74,21 @@ ensure_node() {
   apt-get install -y nodejs npm
 }
 
+ensure_oak_udev() {
+  # Luxonis OAK / Movidius USB devices need a udev rule so non-root users can open them.
+  # Without this, depthai (and depthai-viewer) fail to claim the device after firmware boot.
+  local rules_path="/etc/udev/rules.d/80-movidius.rules"
+  local rule='SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"'
+  if [[ ! -f "${rules_path}" ]] || ! grep -qF "${rule}" "${rules_path}"; then
+    echo "Installing OAK/Movidius udev rule at ${rules_path}…"
+    echo "${rule}" > "${rules_path}"
+    chmod 0644 "${rules_path}"
+    udevadm control --reload-rules
+    udevadm trigger
+    echo "Note: replug the OAK camera so it re-enumerates under the new rule."
+  fi
+}
+
 gemma_ready() {
   curl -fsS "http://127.0.0.1:${GEMMA_PORT}/health" >/dev/null 2>&1 || \
     curl -fsS "http://127.0.0.1:${GEMMA_PORT}/" >/dev/null 2>&1
@@ -214,6 +229,7 @@ main() {
   ensure_docker
   ensure_python_venv_basics
   ensure_node
+  ensure_oak_udev
   require_cmd docker
   require_cmd curl
 

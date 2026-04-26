@@ -9,3 +9,5 @@ uvicorn[standard]>=0.32.0
 pydantic>=2.0.0
 httpx>=0.27.0
 Pillow>=10.0.0
+depthai>=2.24
+numpy>=1.24

@@ -1,12 +1,24 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { WebcamCaptureButton } from "@/components/WebcamCaptureButton";
+import { OakCaptureButton } from "@/components/OakCaptureButton";
 import { ImageWithPointOverlay, type MolmoPoint } from "@/components/ImageWithPointOverlay";
 
 type Role = "user" | "assistant" | "system";
 
-type Msg = { role: Role; content: string; imageUrl?: string; imageName?: string };
+type Msg = {
+  role: Role;
+  content: string;
+  imageUrl?: string;
+  imageName?: string;
+  /** Tool calls produced during this assistant turn (assistant messages only). */
+  toolCalls?: ToolCallLogEntry[];
+  /** MolmoPoint tool results produced during this assistant turn (assistant messages only). */
+  molmoResults?: MolmoChatResult[];
+  /** Blob URL of the image that backs this turn's overlay (assistant messages only). */
+  contextImageUrl?: string;
+};
 type ChatPayloadMsg = { role: Role; content: string };
 
 type MolmoChatResult = {
@@ -80,29 +92,47 @@ export function Chat() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [imageFile, setImageFile] = useState<File | null>(null);
+  /** capture_id of an OAK-D frame already cached on the backend, when imageFile came from there. */
+  const [oakCaptureId, setOakCaptureId] = useState<string | null>(null);
   const [composerImagePreviewUrl, setComposerImagePreviewUrl] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [molmoResults, setMolmoResults] = useState<MolmoChatResult[]>([]);
-  /** Image URL (blob) for the last request that had an upload — used for Molmo overlay (not agent-driven). */
-  const [molmoOverlayImageUrl, setMolmoOverlayImageUrl] = useState<string | null>(null);
-  /** When Molmo has points, user can show/hide the side image+markers (default off). */
-  const [molmoReplyOverlayVisible, setMolmoReplyOverlayVisible] = useState(false);
-  const [toolCallLog, setToolCallLog] = useState<ToolCallLogEntry[]>([]);
+  /** Indices of assistant messages whose Molmo side overlay is currently expanded. */
+  const [overlayExpandedIdx, setOverlayExpandedIdx] = useState<Set<number>>(() => new Set());
   const listRef = useRef<HTMLDivElement>(null);
   const msgImageUrlsRef = useRef<string[]>([]);
   const nextToolKey = useRef(0);
 
-  const mergedMolmoPointsForOverlay = useMemo((): MolmoPoint[] => {
+  function toggleOverlay(idx: number) {
+    setOverlayExpandedIdx((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
+  }
+
+  function pointsFromResults(rs: MolmoChatResult[] | undefined): MolmoPoint[] {
     const out: MolmoPoint[] = [];
-    for (const r of molmoResults) {
+    if (!rs) return out;
+    for (const r of rs) {
       if (r.error) continue;
-      for (const pt of r.points ?? []) {
-        out.push(pt);
-      }
+      for (const pt of r.points ?? []) out.push(pt);
     }
     return out;
-  }, [molmoResults]);
+  }
+
+  /** Webcam, file picker, or "Remove image" — anything that's not an OAK capture clears the id. */
+  const setNonOakImage = useCallback((file: File | null) => {
+    setImageFile(file);
+    setOakCaptureId(null);
+  }, []);
+
+  /** OAK button delivers a (File, capture_id) pair; both are tracked together. */
+  const setOakImage = useCallback((file: File, captureId: string) => {
+    setImageFile(file);
+    setOakCaptureId(captureId);
+  }, []);
 
   useEffect(() => {
     if (!imageFile) {
@@ -136,6 +166,138 @@ export function Chat() {
     });
   }
 
+  async function consumeAgentStream(res: Response, assistantIdx: number) {
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(t || res.statusText);
+    }
+
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error("No response body");
+
+    const updateAssistant = (fn: (m: Msg) => Msg) =>
+      setMessages((prev) => {
+        if (prev[assistantIdx]?.role !== "assistant") return prev;
+        const next = [...prev];
+        next[assistantIdx] = fn(next[assistantIdx]);
+        return next;
+      });
+
+    const mergeToolCall = (
+      list: ToolCallLogEntry[] | undefined,
+      tc: { id?: string; name?: string; args?: string | null },
+    ): ToolCallLogEntry[] => {
+      const prev = list ?? [];
+      if (tc.id) {
+        const idx = prev.findIndex((e) => e.id === tc.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          const cur = next[idx]!;
+          next[idx] = { ...cur, name: tc.name ?? cur.name, args: tc.args ?? cur.args };
+          return next;
+        }
+        return [
+          ...prev,
+          { clientKey: `tc-${tc.id}`, id: tc.id, name: tc.name, args: tc.args ?? undefined },
+        ];
+      }
+      const k = `tmp-${nextToolKey.current++}`;
+      return [...prev, { clientKey: k, name: tc.name, args: tc.args ?? undefined }];
+    };
+
+    const mergeToolResult = (
+      list: ToolCallLogEntry[] | undefined,
+      tr: { id?: string; name?: string; content?: string },
+    ): ToolCallLogEntry[] => {
+      const prev = list ?? [];
+      if (tr.id) {
+        const idx = prev.findIndex((e) => e.id === tr.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          const cur = next[idx]!;
+          next[idx] = { ...cur, name: tr.name ?? cur.name, result: tr.content ?? cur.result };
+          return next;
+        }
+        return [
+          ...prev,
+          { clientKey: `tr-${tr.id}`, id: tr.id, name: tr.name, result: tr.content },
+        ];
+      }
+      const k = `tr-tmp-${nextToolKey.current++}`;
+      return [...prev, { clientKey: k, name: tr.name, result: tr.content }];
+    };
+
+    const dec = new TextDecoder();
+    let acc = "";
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += dec.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload) continue;
+        let data: {
+          token?: string;
+          error?: string;
+          done?: boolean;
+          molmo_result?: MolmoChatResult;
+          tool_call?: { id?: string; name?: string; args?: string | null };
+          tool_result?: { id?: string; name?: string; content?: string };
+        };
+        try {
+          data = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (data.error) throw new Error(data.error);
+        if (data.molmo_result) {
+          const mr = data.molmo_result;
+          updateAssistant((m) => ({
+            ...m,
+            molmoResults: [...(m.molmoResults ?? []), mr],
+          }));
+          scrollToBottom();
+          continue;
+        }
+        if (data.tool_call) {
+          const tc = data.tool_call;
+          updateAssistant((m) => ({ ...m, toolCalls: mergeToolCall(m.toolCalls, tc) }));
+          scrollToBottom();
+          continue;
+        }
+        if (data.tool_result) {
+          const tr = data.tool_result;
+          updateAssistant((m) => ({ ...m, toolCalls: mergeToolResult(m.toolCalls, tr) }));
+          scrollToBottom();
+          continue;
+        }
+        if (data.token) {
+          acc += data.token;
+          updateAssistant((m) => ({ ...m, content: acc }));
+          scrollToBottom();
+        }
+      }
+    }
+  }
+
+  function rollbackOnError(err: unknown) {
+    setError(err instanceof Error ? err.message : "Request failed");
+    setMessages((prev) => {
+      if (prev.length < 2) return prev;
+      if (prev[prev.length - 1].role === "assistant" && !prev[prev.length - 1].content) {
+        return prev.slice(0, -1);
+      }
+      return prev;
+    });
+  }
+
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     const text = input.trim();
@@ -145,13 +307,12 @@ export function Chat() {
     setInput("");
 
     const sentImage = imageFile;
+    const sentOakCaptureId = oakCaptureId;
     setImageFile(null);
+    setOakCaptureId(null);
     const sentImageUrl = sentImage ? URL.createObjectURL(sentImage) : undefined;
     if (sentImageUrl) {
       msgImageUrlsRef.current.push(sentImageUrl);
-      setMolmoOverlayImageUrl(sentImageUrl);
-    } else {
-      setMolmoOverlayImageUrl(null);
     }
     const userMsg: Msg = {
       role: "user",
@@ -164,16 +325,33 @@ export function Chat() {
       role,
       content,
     }));
-    setMessages([...history, { role: "assistant", content: "" }]);
-    setMolmoResults([]);
-    setMolmoReplyOverlayVisible(false);
-    setToolCallLog([]);
+    const assistantIdx = history.length;
+    const assistantPlaceholder: Msg = {
+      role: "assistant",
+      content: "",
+      contextImageUrl: sentImageUrl,
+    };
+    setMessages([...history, assistantPlaceholder]);
     setSending(true);
     scrollToBottom();
 
     try {
       let res: Response;
-      if (sentImage) {
+      if (sentOakCaptureId) {
+        res = await fetch(`${API_BASE}/chat/stream-with-oak-capture-id`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: historyPayload,
+            capture_id: sentOakCaptureId,
+          }),
+        });
+        if (res.status === 404) {
+          throw new Error(
+            "OAK capture expired or not found on the backend. Take a new capture and try again."
+          );
+        }
+      } else if (sentImage) {
         const fd = new FormData();
         fd.append("file", sentImage);
         fd.append("messages_json", JSON.stringify(historyPayload));
@@ -181,6 +359,11 @@ export function Chat() {
           method: "POST",
           body: fd,
         });
+        if (res.status === 404) {
+          throw new Error(
+            "Image chat endpoint is unavailable on the running backend. Restart langgraph-service to load /chat/stream-with-image."
+          );
+        }
       } else {
         res = await fetch(`${API_BASE}/chat/stream`, {
           method: "POST",
@@ -188,148 +371,9 @@ export function Chat() {
           body: JSON.stringify({ messages: historyPayload }),
         });
       }
-
-      if (!res.ok) {
-        const t = await res.text();
-        if (sentImage && res.status === 404) {
-          throw new Error(
-            "Image chat endpoint is unavailable on the running backend. Restart langgraph-service to load /chat/stream-with-image."
-          );
-        }
-        throw new Error(t || res.statusText);
-      }
-
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("No response body");
-
-      const dec = new TextDecoder();
-      let acc = "";
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += dec.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const payload = trimmed.slice(5).trim();
-          if (!payload) continue;
-          let data: {
-            token?: string;
-            error?: string;
-            done?: boolean;
-            molmo_result?: MolmoChatResult;
-            tool_call?: { id?: string; name?: string; args?: string | null };
-            tool_result?: { id?: string; name?: string; content?: string };
-          };
-          try {
-            data = JSON.parse(payload);
-          } catch {
-            continue;
-          }
-          if (data.error) throw new Error(data.error);
-          if (data.molmo_result) {
-            const mr = data.molmo_result;
-            setMolmoResults((prev) => [...prev, mr]);
-            scrollToBottom();
-            continue;
-          }
-          if (data.tool_call) {
-            const tc = data.tool_call;
-            setToolCallLog((prev) => {
-              const id = tc.id;
-              if (id) {
-                const idx = prev.findIndex((e) => e.id === id);
-                if (idx >= 0) {
-                  const next = [...prev];
-                  const cur = next[idx]!;
-                  next[idx] = {
-                    ...cur,
-                    name: tc.name ?? cur.name,
-                    args: tc.args ?? cur.args,
-                  };
-                  return next;
-                }
-                return [
-                  ...prev,
-                  { clientKey: `tc-${id}`, id, name: tc.name, args: tc.args ?? undefined },
-                ];
-              }
-              const k = `tmp-${nextToolKey.current++}`;
-              return [
-                ...prev,
-                {
-                  clientKey: k,
-                  name: tc.name,
-                  args: tc.args ?? undefined,
-                },
-              ];
-            });
-            scrollToBottom();
-            continue;
-          }
-          if (data.tool_result) {
-            const tr = data.tool_result;
-            setToolCallLog((prev) => {
-              const id = tr.id;
-              if (id) {
-                const idx = prev.findIndex((e) => e.id === id);
-                if (idx >= 0) {
-                  const next = [...prev];
-                  const cur = next[idx]!;
-                  next[idx] = {
-                    ...cur,
-                    name: tr.name ?? cur.name,
-                    result: tr.content ?? cur.result,
-                  };
-                  return next;
-                }
-                return [
-                  ...prev,
-                  {
-                    clientKey: `tr-${id}`,
-                    id,
-                    name: tr.name,
-                    result: tr.content,
-                  },
-                ];
-              }
-              const k = `tr-tmp-${nextToolKey.current++}`;
-              return [
-                ...prev,
-                { clientKey: k, name: tr.name, result: tr.content },
-              ];
-            });
-            scrollToBottom();
-            continue;
-          }
-          if (data.token) {
-            acc += data.token;
-            setMessages((prev) => {
-              const next = [...prev];
-              const last = next[next.length - 1];
-              if (last?.role === "assistant") {
-                last.content = acc;
-              }
-              return next;
-            });
-            scrollToBottom();
-          }
-        }
-      }
+      await consumeAgentStream(res, assistantIdx);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Request failed");
-      setMessages((prev) => {
-        if (prev.length < 2) return prev;
-        if (prev[prev.length - 1].role === "assistant" && !prev[prev.length - 1].content) {
-          return prev.slice(0, -1);
-        }
-        return prev;
-      });
+      rollbackOnError(err);
     } finally {
       setSending(false);
     }
@@ -352,12 +396,6 @@ export function Chat() {
           <p className="text-sm text-foreground/60">Send a message to start.</p>
         )}
         {messages.map((m, i) => {
-          const isLastAssistant = m.role === "assistant" && i === messages.length - 1;
-          const canMolmoSideOverlay =
-            isLastAssistant &&
-            molmoOverlayImageUrl != null &&
-            mergedMolmoPointsForOverlay.length > 0;
-          const showMolmoSideLayout = canMolmoSideOverlay && molmoReplyOverlayVisible;
           if (m.role === "user") {
             return (
               <div
@@ -382,6 +420,9 @@ export function Chat() {
               </div>
             );
           }
+          const points = pointsFromResults(m.molmoResults);
+          const canMolmoSideOverlay = m.contextImageUrl != null && points.length > 0;
+          const showMolmoSideLayout = canMolmoSideOverlay && overlayExpandedIdx.has(i);
           return (
             <div
               key={i}
@@ -393,8 +434,8 @@ export function Chat() {
                   <input
                     type="checkbox"
                     className="size-3.5 rounded border-foreground/30 text-foreground accent-foreground"
-                    checked={molmoReplyOverlayVisible}
-                    onChange={(e) => setMolmoReplyOverlayVisible(e.target.checked)}
+                    checked={overlayExpandedIdx.has(i)}
+                    onChange={() => toggleOverlay(i)}
                   />
                   <span>Show Molmo point map beside reply</span>
                 </label>
@@ -404,13 +445,13 @@ export function Chat() {
                   <div className="min-w-0 flex-1 whitespace-pre-wrap text-sm leading-relaxed">
                     {m.content}
                   </div>
-                  <div className="shrink-0 sm:pl-0">
+                  <div className="min-w-0 w-full sm:w-auto sm:max-w-[45%] sm:flex-none">
                     <p className="mb-1.5 text-[11px] text-foreground/50">
                       Molmo detections (from tool result, not Gemma)
                     </p>
                     <ImageWithPointOverlay
-                      imageUrl={molmoOverlayImageUrl!}
-                      points={mergedMolmoPointsForOverlay}
+                      imageUrl={m.contextImageUrl!}
+                      points={points}
                       alt="User image with Molmo point overlay"
                     />
                   </div>
@@ -426,129 +467,119 @@ export function Chat() {
                   {m.content}
                 </div>
               )}
+              {m.toolCalls && m.toolCalls.length > 0 && (
+                <div className="mt-3 space-y-2 rounded-lg border border-foreground/15 bg-background/40 p-3">
+                  <h3 className="text-xs font-medium text-foreground/80">Tool calls</h3>
+                  <ul className="space-y-2 text-xs text-foreground/80">
+                    {m.toolCalls.map((t) => (
+                      <li key={t.clientKey} className="rounded border border-foreground/10 bg-background/60 p-2">
+                        <div className="font-mono text-[11px] text-foreground/55">
+                          {t.name ? <span className="text-foreground/80">{t.name}</span> : "(unnamed tool)"}
+                          {t.id ? <span className="text-foreground/45"> · id {t.id}</span> : null}
+                        </div>
+                        {t.args ? (
+                          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-foreground/75">
+                            args: {t.args}
+                          </pre>
+                        ) : null}
+                        {t.result ? (
+                          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-foreground/75">
+                            result: {t.result}
+                          </pre>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {m.molmoResults && m.molmoResults.length > 0 && (
+                <div className="mt-3 space-y-3 rounded-lg border border-foreground/15 bg-background/40 p-3">
+                  <h3 className="text-xs font-medium text-foreground/80">
+                    MolmoPoint (tool) — 0–1 in image space; not from Gemma
+                  </h3>
+                  {m.molmoResults.map((mr, k) => (
+                    <div key={k} className="space-y-1.5 text-sm">
+                      {mr.error && <p className="text-red-300">{mr.error}</p>}
+                      {(mr.model_id || mr.device) && (
+                        <p className="text-xs text-foreground/60">
+                          {mr.model_id ? (
+                            <>
+                              <span className="text-foreground/80">Model:</span>{" "}
+                              <code className="break-all">{mr.model_id}</code>
+                              {mr.device ? " · " : null}
+                            </>
+                          ) : null}
+                          {mr.device ? (
+                            <>
+                              <span className="text-foreground/80">Device:</span>{" "}
+                              <code>{mr.device}</code>
+                            </>
+                          ) : null}
+                        </p>
+                      )}
+                      {mr.points && mr.points.length > 0 && (
+                        <div className="overflow-x-auto rounded border border-foreground/10">
+                          <table className="w-full min-w-[18rem] text-left text-xs">
+                            <thead>
+                              <tr className="border-b border-foreground/10 text-foreground/50">
+                                <th className="p-1.5 pr-2 font-medium">#</th>
+                                <th className="p-1.5 pr-2 font-medium">object_id</th>
+                                <th className="p-1.5 pr-2 font-medium">image</th>
+                                <th className="p-1.5 pr-2 font-medium">x (0–1)</th>
+                                <th className="p-1.5 pr-2 font-medium">y (0–1)</th>
+                                <th className="p-1.5 pr-2 font-medium" title="Pixel x: from API in pixel space, or derived from 0–1 × width when image size is known">
+                                  x (px)
+                                </th>
+                                <th className="p-1.5 pr-2 font-medium" title="Pixel y: from API in pixel space, or derived from 0–1 × height when image size is known">
+                                  y (px)
+                                </th>
+                                <th className="p-1.5 font-medium" title="OAK-D depth at point (median over 7×7 ROI). — when not available or out-of-range.">
+                                  distance (m)
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {mr.points.map((p, j) => {
+                                const c = molmoPointCells(p, mr);
+                                return (
+                                  <tr key={j} className="border-b border-foreground/5 last:border-0">
+                                    <td className="p-1.5 pr-2 tabular-nums text-foreground/80">{j + 1}</td>
+                                    <td className="p-1.5 pr-2 tabular-nums">{p.object_id}</td>
+                                    <td className="p-1.5 pr-2 tabular-nums">{p.image_index}</td>
+                                    <td className="p-1.5 pr-2 tabular-nums">{formatPointCell(c.x01)}</td>
+                                    <td className="p-1.5 pr-2 tabular-nums">{formatPointCell(c.y01)}</td>
+                                    <td className="p-1.5 pr-2 tabular-nums text-foreground/70">
+                                      {Number.isNaN(c.xPx) ? "—" : c.xPx.toFixed(1)}
+                                    </td>
+                                    <td className="p-1.5 pr-2 tabular-nums text-foreground/70">
+                                      {Number.isNaN(c.yPx) ? "—" : c.yPx.toFixed(1)}
+                                    </td>
+                                    <td className="p-1.5 tabular-nums text-foreground/80">
+                                      {typeof p.depth_m === "number" ? p.depth_m.toFixed(2) : "—"}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                      {mr.generated_text && (
+                        <p className="whitespace-pre-wrap break-words text-xs text-foreground/70">
+                          <span className="text-foreground/50">raw text: </span>
+                          {mr.generated_text}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           );
         })}
         {error && (
           <div className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
             {error}
-          </div>
-        )}
-        {toolCallLog.length > 0 && (
-          <div className="space-y-2 rounded-lg border border-foreground/15 bg-foreground/5 p-3">
-            <h2 className="text-sm font-medium text-foreground/90">Tool calls (agent)</h2>
-            <ul className="space-y-2 text-xs text-foreground/80">
-              {toolCallLog.map((t) => (
-                <li key={t.clientKey} className="rounded border border-foreground/10 bg-background/40 p-2">
-                  <div className="font-mono text-[11px] text-foreground/55">
-                    {t.name ? <span className="text-foreground/80">{t.name}</span> : "(unnamed tool)"}
-                    {t.id ? <span className="text-foreground/45"> · id {t.id}</span> : null}
-                  </div>
-                  {t.args ? (
-                    <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-foreground/75">
-                      args: {t.args}
-                    </pre>
-                  ) : null}
-                  {t.result ? (
-                    <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-foreground/75">
-                      result: {t.result}
-                    </pre>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {molmoResults.length > 0 && (
-          <div className="space-y-3 rounded-lg border border-foreground/15 bg-foreground/5 p-3">
-            <h2 className="text-sm font-medium text-foreground/90">
-              MolmoPoint (tool) — 0–1 in image space; not from Gemma
-            </h2>
-            <p className="text-xs text-foreground/55">
-              Coordinates are 0–1 in image space when the backend normalizes them, or from pixel
-              values using <strong className="text-foreground/70">image size</strong> from the
-              tool when included. Pixels (last columns) are shown when the point is in pixel space
-              or when size is known for converted 0–1 values.
-            </p>
-            {molmoResults.map((m, i) => (
-              <div key={i} className="space-y-1.5 text-sm">
-                {m.error && (
-                  <p className="text-red-300">
-                    {m.error}
-                  </p>
-                )}
-                {(m.model_id || m.device) && (
-                  <p className="text-xs text-foreground/60">
-                    {m.model_id ? (
-                      <>
-                        <span className="text-foreground/80">Model:</span>{" "}
-                        <code className="break-all">{m.model_id}</code>
-                        {m.device ? " · " : null}
-                      </>
-                    ) : null}
-                    {m.device ? (
-                      <>
-                        <span className="text-foreground/80">Device:</span>{" "}
-                        <code>{m.device}</code>
-                      </>
-                    ) : null}
-                  </p>
-                )}
-                {m.points && m.points.length > 0 && (
-                  <div className="overflow-x-auto rounded border border-foreground/10">
-                    <table className="w-full min-w-[18rem] text-left text-xs">
-                      <thead>
-                        <tr className="border-b border-foreground/10 text-foreground/50">
-                          <th className="p-1.5 pr-2 font-medium">#</th>
-                          <th className="p-1.5 pr-2 font-medium">object_id</th>
-                          <th className="p-1.5 pr-2 font-medium">image</th>
-                          <th className="p-1.5 pr-2 font-medium">x (0–1)</th>
-                          <th className="p-1.5 pr-2 font-medium">y (0–1)</th>
-                          <th className="p-1.5 pr-2 font-medium" title="Pixel x: from API in pixel space, or derived from 0–1 × width when image size is known">
-                            x (px)
-                          </th>
-                          <th className="p-1.5 font-medium" title="Pixel y: from API in pixel space, or derived from 0–1 × height when image size is known">
-                            y (px)
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {m.points.map((p, j) => {
-                          const c = molmoPointCells(p, m);
-                          return (
-                          <tr key={j} className="border-b border-foreground/5 last:border-0">
-                            <td className="p-1.5 pr-2 tabular-nums text-foreground/80">
-                              {j + 1}
-                            </td>
-                            <td className="p-1.5 pr-2 tabular-nums">{p.object_id}</td>
-                            <td className="p-1.5 pr-2 tabular-nums">{p.image_index}</td>
-                            <td className="p-1.5 pr-2 tabular-nums">
-                              {formatPointCell(c.x01)}
-                            </td>
-                            <td className="p-1.5 pr-2 tabular-nums">
-                              {formatPointCell(c.y01)}
-                            </td>
-                            <td className="p-1.5 pr-2 tabular-nums text-foreground/70">
-                              {Number.isNaN(c.xPx) ? "—" : c.xPx.toFixed(1)}
-                            </td>
-                            <td className="p-1.5 tabular-nums text-foreground/70">
-                              {Number.isNaN(c.yPx) ? "—" : c.yPx.toFixed(1)}
-                            </td>
-                          </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-                {m.generated_text && (
-                  <p className="whitespace-pre-wrap break-words text-xs text-foreground/70">
-                    <span className="text-foreground/50">raw text: </span>
-                    {m.generated_text}
-                  </p>
-                )}
-              </div>
-            ))}
           </div>
         )}
       </div>
@@ -567,7 +598,7 @@ export function Chat() {
               <button
                 type="button"
                 className="rounded border border-foreground/20 px-2 py-1 text-xs text-foreground/80 hover:bg-foreground/5"
-                onClick={() => setImageFile(null)}
+                onClick={() => setNonOakImage(null)}
                 disabled={sending}
               >
                 Remove image
@@ -577,7 +608,12 @@ export function Chat() {
         )}
         <div className="flex flex-wrap items-center gap-2">
           <WebcamCaptureButton
-            onCapture={setImageFile}
+            onCapture={setNonOakImage}
+            disabled={sending}
+          />
+          <OakCaptureButton
+            apiBase={API_BASE}
+            onCapture={setOakImage}
             disabled={sending}
           />
           <label className="shrink-0 cursor-pointer text-sm text-foreground/55 underline decoration-foreground/25 underline-offset-2 hover:text-foreground/80">
@@ -586,7 +622,7 @@ export function Chat() {
               type="file"
               accept="image/jpeg,image/png,image/webp"
               className="hidden"
-              onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
+              onChange={(e) => setNonOakImage(e.target.files?.[0] ?? null)}
               disabled={sending}
             />
           </label>
